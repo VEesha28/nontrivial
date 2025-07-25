@@ -1,0 +1,93 @@
+
+import requests
+
+API_KEY = API_KEY
+base = "https://api.mosqlimate.org/api/datastore"
+headers = {"X-UID-Key": API_KEY}
+
+params = {
+    "geocode": 3304557,
+    "start": "2010-01-01",
+    "end": "2025-07-01"
+}
+resp = requests.get(f"{base}/climate/", headers=headers, params=params)
+climate = resp.json()
+
+params = {
+    "geocode": 3304557,
+    "disease": "dengue",
+    "start": "2010-01-01",
+    "end": "2025-07-01"
+}
+resp = requests.get(f"{base}/infodengue/", headers=headers, params=params)
+cases = resp.json()
+
+params = {
+    "geocode": 3304557,
+    "start": "2010-01-01",
+    "end": "2025-07-01"
+}
+resp = requests.get(f"{base}/mosquito/", headers=headers, params=params)
+mosquito = resp.json()
+
+params = {
+   "disease": "dengue",
+   "uf": "RJ",
+   "year": 2025  # or omit to get current-year data
+}
+resp = requests.get(f"{base}/episcanner/", headers=headers, params=params)
+epi = resp.json()
+
+import mosqlient
+
+climate_df_from_mosqlient = mosqlient.get_climate_weekly(
+    api_key = API_KEY,
+    start = "201001",
+    end = "202452",
+    # uf = "RJ",
+    geocode = 3304557,
+)
+
+print(climate_df_from_mosqlient)
+import mosqlient
+
+cases_df_from_mosqlient = mosqlient.get_infodengue(
+    api_key = API_KEY,
+    disease='dengue',
+    start_date = "2010-01-01", # Changed format to YYYY-MM-DD
+    end_date = "2024-12-31",   # Changed format to YYYY-MM-DD (assuming end of 2024 for epiweek 52)
+    # uf = "RJ",
+    geocode = 3304557,
+)
+
+import pandas as pd
+
+# Ensure 'SE' and 'epiweek' columns are in a consistent format (e.g., integer) for merging
+if 'SE' in cases_df_from_mosqlient.columns:
+    cases_df_from_mosqlient['SE'] = cases_df_from_mosqlient['SE'].astype(int)
+
+if 'epiweek' in climate_df_from_mosqlient.columns:
+    climate_df_from_mosqlient['epiweek'] = climate_df_from_mosqlient['epiweek'].astype(int)
+
+# Rename geocode column in cases_df_from_mosqlient for consistent merging if needed
+if 'municipio_geocodigo' in cases_df_from_mosqlient.columns:
+    cases_df_from_mosqlient = cases_df_from_mosqlient.rename(columns={'municipio_geocodigo': 'geocode'})
+
+# Rename geocode column in climate_df_from_mosqlient for consistent merging if needed
+if 'geocodigo' in climate_df_from_mosqlient.columns:
+    climate_df_from_mosqlient = climate_df_from_mosqlient.rename(columns={'geocodigo': 'geocode'})
+
+
+# Perform the merge on 'geocode' and the respective epiweek columns ('SE' and 'epiweek')
+merged_cases_climate_mosqlient = pd.merge(
+    cases_df_from_mosqlient,
+    climate_df_from_mosqlient,
+    left_on=['geocode', 'SE'],  # Use 'geocode' and 'SE' from cases_df_from_mosqlient
+    right_on=['geocode', 'epiweek'], # Use 'geocode' and 'epiweek' from climate_df_from_mosqlient
+    how='outer' # Use outer join to keep all rows
+)
+
+# Display info about the merged dataframe
+print("Merged Cases and Climate DataFrame (from mosqlient):")
+display(merged_cases_climate_mosqlient.head())
+merged_cases_climate_mosqlient.info()
