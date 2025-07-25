@@ -282,7 +282,7 @@ if api_key and run_button:
             for m in ['base', 'fus', 'rf']:
                 data_to_plot = np.array(forecast[m][:plot_len])
                 ax.plot(plot_indices[~np.isnan(data_to_plot)], data_to_plot[~np.isnan(data_to_plot)], label=f'{m.upper()}', linestyle='--')
-            ax.set_title(f'1-Week Ahead Dengue Case Forecast for {year}')
+            ax.set_title(f'Dengue Case Forecast for {year}')
             ax.set_xlabel('Date')
             ax.set_ylabel('Estimated Cases')
             ax.legend()
