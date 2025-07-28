@@ -1,3 +1,4 @@
+%%writefile app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,285 +11,586 @@ import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="Dengue Forecasting", layout="wide")
 
-# User inputs
-st.title("Dengue Forecasting: Predicted vs Observed Cases")
-api_key = st.text_input("Enter your Mosqlimate API Key:", type="password")
-geocode = st.number_input("Enter geocode (e.g., 3304557):", value=3304557)
-year = st.number_input("Enter year to visualize (e.g., 2023):", min_value=2000, max_value=2100, value=2023)
-run_button = st.button("Run Forecast")
+# --- Model Functions and Parameters (Copied from previous cell) ---
 
-if api_key and run_button:
-    # --- Data Acquisition ---
-    import mosqlient
+# Parameters
+init_params = {
+    'alpha_h': 1/7, 'gamma_h': 1/7, 'mu_m': 1/10, 'nu_m': 1/10, 'alpha_m': 1/5,
+    'beta0': 0.05, 'beta_temp': 0.005, 'beta_precip': 0.0005,
+    'ν_vac': 0.0, 'ε_vac': 0.0, 'ν_wol': 0.0, 'μ_ctrl': 0.0, 'trans_wol': 0.1,
+    'Tmin': 10.0, 'Tmax': 40.0, 'R0': 50.0, 'k_r': 0.1, 'beta_humid': 0.002,
+    'BIRTH_DEATH_RATE': 1 / (70 * 52) # Assuming a constant birth/death rate relative to population
+}
 
-    try:
-        with st.spinner("Downloading data..."):
-            climate_df = mosqlient.get_climate_weekly(
-                api_key = api_key,
-                start = "201001",
-                end = "202452",
-                geocode = geocode,
-            )
-            cases_df = mosqlient.get_infodengue(
-                api_key = api_key,
-                disease='dengue',
-                start_date = "2010-01-01",
-                end_date = "2024-12-31",
-                geocode = geocode,
-            )
+def briere(T, Tmin, Tmax, c=1e-4):
+    return np.maximum(c * T * (T - Tmin) * np.sqrt(np.maximum(Tmax - T, 0)), 0)
 
-        # Data cleaning and merging
-        if 'SE' in cases_df.columns:
-            cases_df['SE'] = cases_df['SE'].astype(int)
-        if 'epiweek' in climate_df.columns:
-            climate_df['epiweek'] = climate_df['epiweek'].astype(int)
-        if 'municipio_geocodigo' in cases_df.columns:
-            cases_df = cases_df.rename(columns={'municipio_geocodigo': 'geocode'})
-        if 'geocodigo' in climate_df.columns:
-            climate_df = climate_df.rename(columns={'geocodigo': 'geocode'})
+def logistic_rainfall(R, R0, k):
+    exp_input = -k * (R - R0)
+    exp_input = np.clip(exp_input, -20, 20)
+    return 1 / (1 + np.exp(exp_input))
 
-        merged = pd.merge(
-            cases_df,
-            climate_df,
-            left_on=['geocode', 'SE'],
-            right_on=['geocode', 'epiweek'],
-            how='outer'
-        )
-        merged['data_iniSE'] = pd.to_datetime(merged['data_iniSE'])
-        merged.set_index('data_iniSE', inplace=True)
-        st.success("Data downloaded and merged successfully.")
-    except Exception as e:
-        st.error(f"Error downloading or merging data: {e}")
-        st.stop()
+def seir_sei_control(t, state, params, climate, Nh, N_mosq):
+    Sh, Eh, Ih, Rh, Vh, Sm, Em, Im, Wm = np.maximum(state, 0)
+    Nh = max(Nh, 1) # Ensure human population is at least 1
+    N_mosq = max(N_mosq, 1) # Ensure mosquito population is at least 1
 
-    # --- Modeling & Forecast Section (from frameworkpy) ---
-    try:
-        # Setup columns
-        climate_cols = ['tempmed', 'precip_tot_sum', 'umidmed']
-        target_col = 'casos_est'
-        # Ensure required columns exist
-        for col in climate_cols + [target_col]:
-            if col not in merged.columns:
-                st.error(f"Column {col} not found in merged data. Check data source or column names.")
-                st.stop()
+    T, R, H = climate['tempmed'], climate['precip_tot_sum'], climate['umidmed']
 
-        # Create lags
-        for feat in [target_col] + climate_cols:
-            for lag in range(1, 5):
-                merged[f'{feat}_lag{lag}'] = merged[feat].shift(lag)
-        lag_cols = [f'{feat}_lag{lag}' for feat in [target_col] + climate_cols for lag in range(1, 5)]
-        merged.dropna(subset=lag_cols, inplace=True)
+    beta0 = params.get('beta0_est', params.get('beta0', init_params['beta0']))
+    beta_temp = params.get('beta_temp_est', params.get('beta_temp', init_params['beta_temp']))
+    beta_precip = params.get('beta_precip_est', params.get('beta_precip', init_params['beta_precip']))
+    Tmin = params.get('Tmin_est', params.get('Tmin', init_params['Tmin']))
+    Tmax = params.get('Tmax_est', params.get('Tmax', init_params['Tmax']))
+    R0 = params.get('R0_est', params.get('R0', init_params['R0']))
+    k_r = params.get('k_r_est', params.get('k_r', init_params['k_r']))
+    beta_humid = params.get('beta_humid_est', params.get('beta_humid', init_params['beta_humid']))
 
-        # Extract years
-        merged['year'] = merged['SE'].astype(str).str[:4].astype(int)
-        df = merged
+    nu_vac = init_params['ν_vac']
+    epsilon_vac = init_params['ε_vac']
+    nu_wol = init_params['ν_wol']
+    mu_ctrl = init_params['μ_ctrl']
+    trans_wol = init_params['trans_wol']
+    alpha_h = init_params['alpha_h'] # Fixed parameters
+    gamma_h = init_params['gamma_h'] # Fixed parameters
+    mu_m = init_params['mu_m']     # Fixed parameters
+    nu_m = init_params['nu_m']     # Fixed parameters
+    alpha_m = init_params['alpha_m'] # Fixed parameters
+    birth_death_rate = init_params['BIRTH_DEATH_RATE'] # Fixed birth/death rate
 
-        # Parameters (as in original)
-        N_obs, N_mosq = 100000, 100000
-        init_params = {
-            'alpha_h': 1/7, 'gamma_h': 1/7, 'mu_m': 1/10, 'nu_m': 1/10, 'alpha_m': 1/5,
-            'beta0': 0.05, 'beta_temp': 0.005, 'beta_precip': 0.0005,
-            'ν_vac': 0.0, 'ε_vac': 0.0, 'ν_wol': 0.0, 'μ_ctrl': 0.0, 'trans_wol': 0.1,
-            'Tmin': 10.0, 'Tmax': 40.0, 'R0': 50.0, 'k_r': 0.1, 'beta_humid': 0.002
+    T_br = briere(T, Tmin, Tmax)
+    R_eff = logistic_rainfall(R, R0, k_r)
+    β = max(0, T_br * R_eff + beta_humid * H)
+
+    λ_h = β * (Im + Wm * trans_wol) / Nh # Human force of infection
+    λ_m = β * Ih / Nh # Mosquito force of infection (per mosquito)
+
+    # ODE system
+    dSh = birth_death_rate * Nh - λ_h * Sh - birth_death_rate * Sh - nu_vac * Sh
+    dEh = λ_h * Sh - alpha_h * Eh - birth_death_rate * Eh
+    dIh = alpha_h * Eh - gamma_h * Ih - birth_death_rate * Ih
+    dRh = gamma_h * Ih - birth_death_rate * Rh
+    dVh = nu_vac * (Sh + Rh) - epsilon_vac * λ_h * Vh - birth_death_rate * Vh
+    dSm = nu_m * N_mosq - λ_m * Sm - (mu_m + mu_ctrl + nu_wol) * Sm
+    dEm = λ_m * Sm - (alpha_m + mu_m + mu_ctrl) * Em
+    dIm = alpha_m * Em - (mu_m + mu_ctrl) * Im
+    dWm = nu_wol * (Sm + Em + Im) - (mu_m + mu_ctrl) * Wm
+
+
+    return [dSh, dEh, dIh, dRh, dVh, dSm, dEm, dIm, dWm]
+
+# Adjusted initial state template - Proportions for human (summing to 1), proportions for mosquito
+init_state_template = np.array([
+    0.99, 0.005, 0.005, 0, 0.0, # Proportions of Nh for Sh, Eh, Ih, Rh, Vh (sum to 1)
+    0.99, 0.005, 0.005, 0.0, # Proportions of N_mosq for Sm, Em, Im, Wm (sum to 1)
+    init_params['Tmin'], init_params['Tmax'], init_params['R0'], init_params['k_r'], init_params['beta_humid'] # Parameters to estimate
+])
+
+# Initial P matrix - based on proportions for human and mosquito compartments
+init_P_template = np.diag([*(1.0,) * 5, *(1.0,) * 4, 1.0, 1.0, 10.0, 0.1, 0.001]) # P for proportions and estimated parameters
+Q = np.diag([10] * 9 + [1e-8, 1e-8, 1e-7, 1e-9, 1e-10]) # Process noise Q
+n_ens = 100 # Ensemble size
+rf_R_val = 300. # R value for RF observation in fusion
+
+
+# Corrected hx functions: they should only depend on the state vector
+# The measurement is the number of human cases (Ih * gamma_h)
+def hx_base(state):
+    # state[:9] contains the compartmental states (actual counts)
+    return np.array([init_params['gamma_h'] * state[2]])
+
+def hx_fusion(state):
+     # state[:9] contains the compartmental states (actual counts)
+     # This function predicts the measurements given the state.
+     # The first measurement is ODE-derived cases.
+     # The second measurement is the RF prediction, which is external to the ODE state.
+     # We return a placeholder (0) for the RF prediction in the predicted measurement.
+     return np.array([init_params['gamma_h'] * state[2], 0.])
+
+
+# EnKF fx - Modified to use seir_sei_control and handle 9 compartments + 5 betas + Nh + N_mosq
+def fx(x, dt):
+    x = np.atleast_2d(x)
+    cl = fx.climate # Climate data for this step
+    pf = fx.pf # Fixed parameters
+    Nh = fx.Nh # Human Population for this year
+    N_mosq = fx.N_mosq # Mosquito Population for this year
+
+    X = np.zeros_like(x)
+    for i, s in enumerate(x):
+        s = np.asarray(s)
+        # Handle potential NaNs in state - replace with a small positive number
+        if not np.isfinite(s).all():
+            s = np.nan_to_num(s, nan=1e-5)
+
+        # Extract estimated parameters from state vector (indices 9 to 13)
+        # Add clipping to estimated parameters to keep them within reasonable bounds
+        Tmin_est = np.clip(s[9], 0.0, 30.0)
+        Tmax_est = np.clip(s[10], 30.0, 50.0)
+        R0_est = np.clip(s[11], 0.0, 200.0)
+        k_r_est = np.clip(s[12], 0.0, 1.0)
+        beta_humid_est = np.clip(s[13], 0.0, 0.1)
+
+        estimated_params = {
+            'Tmin_est': Tmin_est, 'Tmax_est': Tmax_est, 'R0_est': R0_est, 'k_r_est': k_r_est, 'beta_humid_est': beta_humid_est
         }
 
-        def briere(T, Tmin, Tmax, c=1e-4):
-            return np.maximum(c * T * (T - Tmin) * np.sqrt(np.maximum(Tmax - T, 0)), 0)
-        def logistic_rainfall(R, R0, k):
-            exp_input = -k * (R - R0)
-            exp_input = np.clip(exp_input, -20, 20)
-            return 1 / (1 + np.exp(exp_input))
+        # Combine fixed and estimated parameters for ODE
+        ode_par = {
+            **pf, # Includes fixed parameters like alpha_h, gamma_h, etc.
+            **estimated_params, # Includes estimated parameters
+            'BIRTH_DEATH_RATE': init_params['BIRTH_DEATH_RATE'] # Assuming constant birth/death rate
+        }
 
-        def seir_sei_control(t, state, params, climate):
-            Sh, Eh, Ih, Rh, Vh, Sm, Em, Im, Wm = np.maximum(state, 0)
-            Nh = Sh + Eh + Ih + Rh + Vh
-            Nh = max(Nh, 1)
-            T, R, H = climate['tempmed'], climate['precip_tot_sum'], climate['umidmed']
-            beta0 = params.get('beta0_est', params.get('beta0', 0.05))
-            beta_temp = params.get('beta_temp_est', params.get('beta_temp', 0.005))
-            beta_precip = params.get('beta_precip_est', params.get('beta_precip', 0.0005))
-            Tmin = params.get('Tmin_est', params.get('Tmin', 10.0))
-            Tmax = params.get('Tmax_est', params.get('Tmax', 40.0))
-            R0 = params.get('R0_est', params.get('R0', 50.0))
-            k_r = params.get('k_r_est', params.get('k_r', 0.1))
-            beta_humid = params.get('beta_humid_est', params.get('beta_humid', 0.002))
-            nu_vac = params['ν_vac']
-            epsilon_vac = params['ε_vac']
-            nu_wol = params['ν_wol']
-            mu_ctrl = params['μ_ctrl']
-            trans_wol = params['trans_wol']
-            alpha_h = params['alpha_h']
-            gamma_h = params['gamma_h']
-            mu_m = params['mu_m']
-            nu_m = params['nu_m']
-            alpha_m = params['alpha_m']
-            T_br = briere(T, Tmin, Tmax)
-            R_eff = logistic_rainfall(R, R0, k_r)
-            β = max(0, T_br * R_eff + beta_humid * H)
-            λ_h = β * (Im + Wm * trans_wol) / Nh
-            λ_m = β * Ih / Nh
-            dSh = params['BIRTH_DEATH_RATE'] * N_obs - λ_h * Sh - params['BIRTH_DEATH_RATE'] * Sh - nu_vac * Sh
-            dEh = λ_h * Sh - alpha_h * Eh - params['BIRTH_DEATH_RATE'] * Eh
-            dIh = alpha_h * Eh - gamma_h * Ih - params['BIRTH_DEATH_RATE'] * Ih
-            dRh = gamma_h * Ih - params['BIRTH_DEATH_RATE'] * Rh
-            dVh = nu_vac * (Sh + Rh) - epsilon_vac * λ_h * Vh - params['BIRTH_DEATH_RATE'] * Vh
-            dSm = nu_m * N_mosq - λ_m * Sm - (mu_m + mu_ctrl + nu_wol) * Sm
-            dEm = λ_m * Sm - (alpha_m + mu_m + mu_ctrl) * Em
-            dIm = alpha_m * Em - (mu_m + mu_ctrl) * Im
-            dWm = nu_wol * (Sm + Em + Im) - (mu_m + mu_ctrl) * Wm
-            return [dSh, dEh, dIh, dRh, dVh, dSm, dEm, dIm, dWm]
+        # Pass the first 9 elements of the state (compartmental states) to the ODE solver
+        sol = solve_ivp(seir_sei_control, [0, 7], s[:9], args=(ode_par, cl, Nh, N_mosq), t_eval=[7], method='RK45', events=None) # Use RK45 method
 
-        init_state = np.array([
-            N_obs * 0.99, N_obs * 0.005, N_obs * 0.005, 0, N_obs * 0.0,
-            N_mosq * 0.99, N_mosq * 0.005, N_mosq * 0.005, N_mosq * 0.0,
-            init_params['Tmin'], init_params['Tmax'], init_params['R0'], init_params['k_r'], init_params['beta_humid']
+        # Update the state in X
+        if sol.status == 0:
+            X[i, :9] = sol.y[:, -1] # Update compartmental states (actual counts)
+        else:
+            X[i, :9] = s[:9] # If ODE failed, keep the previous compartmental states
+
+        # Update estimated parameters in X after clipping
+        X[i, 9] = estimated_params['Tmin_est']
+        X[i, 10] = estimated_params['Tmax_est']
+        X[i, 11] = estimated_params['R0_est']
+        X[i, 12] = estimated_params['k_r_est']
+        X[i, 13] = estimated_params['beta_humid_est']
+
+    # Ensure noise has the correct dimensions (14 elements)
+    noise = np.random.multivariate_normal(np.zeros(X.shape[1]), Q, X.shape[0])
+    return np.maximum(X + noise, 0) # Ensure non-negativity after adding noise
+
+def initialize_filter_state(yearly_df, yearly_avg_pop_series, target_col, init_params, init_state_template, init_P_template):
+    year = yearly_df['year'].iloc[0]
+    # Explicitly cast to float and ensure positive
+    current_year_pop = float(yearly_avg_pop_series.get(year, 100000))
+    if current_year_pop <= 0: current_year_pop = 100000.0 # Fallback for non-positive population
+
+    # Explicitly cast to float and ensure positive
+    current_year_mosq_pop = float(0.7 * current_year_pop)
+    if current_year_mosq_pop <= 0: current_year_mosq_pop = 0.7 * 100000.0 # Fallback for non-positive mosquito population
+
+
+    if not yearly_df.empty:
+        first_obs = yearly_df.iloc[0][target_col]
+
+        # Set initial Sh based on the specified multiplier (0.01) and current year's human population
+        initial_Sh = max(current_year_pop * 0.01, 0) # Using the specified multiplier 0.01
+
+        # Estimate initial infected humans based on the first observation and recovery rate
+        initial_Ih = max(first_obs / init_params['gamma_h'], 0)
+        # Set initial Exposed humans as a proportion of Infected (can be tuned, using a fixed ratio for now)
+        initial_Eh = max(initial_Ih * 0.5, 0)
+
+        # Set initial Recovered and Vaccinated (assuming initially 0 or negligible relative to Sh, Eh, Ih)
+        initial_Rh = 0.0
+        initial_Vh = 0.0
+
+        # Adjust initial compartments to sum up to current_year_pop if needed (should not happen with Sh calc)
+        current_human_sum = initial_Sh + initial_Eh + initial_Ih + initial_Rh + initial_Vh
+        if current_human_sum > current_year_pop:
+             # If sum exceeds population, scale down proportions to fit
+             scale_factor = current_year_pop / current_human_sum
+             initial_Sh *= scale_factor
+             initial_Eh *= scale_factor
+             initial_Ih *= scale_factor
+             initial_Rh *= scale_factor
+             initial_Vh *= scale_factor
+             # Re-calculate Sh after scaling others to ensure sum is Nh
+             initial_Sh = max(current_year_pop - initial_Eh - initial_Ih - initial_Rh - initial_Vh, 0)
+
+
+        # Initialize mosquito compartments based on the calculated yearly mosquito population
+        initial_Sm = current_year_mosq_pop * init_state_template[5] # Use proportion from template
+        initial_Em = current_year_mosq_pop * init_state_template[6] # Use proportion from template
+        initial_Im = current_year_mosq_pop * init_state_template[7] # Use proportion from template
+        initial_Wm = current_year_mosq_pop * init_state_template[8] # Use proportion from template
+
+
+        # Initialize parameters to be estimated from the template
+        initial_params_est = init_state_template[9:]
+
+        # Combine into the full initial state vector (actual counts for human and mosquito compartments)
+        filter_init_state = np.array([
+            initial_Sh, initial_Eh, initial_Ih, initial_Rh, initial_Vh,
+            initial_Sm, initial_Em, initial_Im, initial_Wm,
+            *initial_params_est
         ])
-        init_P = np.diag([*(N_obs * 0.01,) * 5, *(N_mosq * 0.01,) * 4, 1.0, 1.0, 10.0, 0.1, 0.001])
-        Q = np.diag([10] * 9 + [1e-8, 1e-8, 1e-7, 1e-9, 1e-10])
-        n_ens = 100
 
-        def hx_base(state):
-            return np.array([init_params['gamma_h'] * state[2]])
-        def hx_fusion(state):
-            return np.array([init_params['gamma_h'] * state[2], 0.])
+    else:
+         # Fallback if data is empty - Initialize based on scaled template proportions
+         initial_human_comps = init_state_template[:5] * current_year_pop
+         initial_mosq_comps = init_state_template[5:9] * current_year_mosq_pop
 
-        def fx(x, dt):
-            x = np.atleast_2d(x)
-            cl = fx.climate
-            pf = fx.pf
-            X = np.zeros_like(x)
-            for i, s in enumerate(x):
-                s = np.asarray(s)
-                if not np.isfinite(s).all():
-                    s = np.nan_to_num(s, nan=1e-5)
-                Tmin_est = np.clip(s[9], 0.0, 30.0)
-                Tmax_est = np.clip(s[10], 30.0, 50.0)
-                R0_est = np.clip(s[11], 0.0, 200.0)
-                k_r_est = np.clip(s[12], 0.0, 1.0)
-                beta_humid_est = np.clip(s[13], 0.0, 0.1)
-                estimated_params = {
-                    'Tmin_est': Tmin_est, 'Tmax_est': Tmax_est, 'R0_est': R0_est, 'k_r_est': k_r_est, 'beta_humid_est': beta_humid_est
-                }
-                ode_par = {
-                    **pf,
-                    **estimated_params,
-                    'BIRTH_DEATH_RATE': 1 / (70 * 52)
-                }
-                sol = solve_ivp(seir_sei_control, [0, 7], s[:9], args=(ode_par, cl), t_eval=[7], method='RK45', events=None)
-                if sol.status == 0:
-                    X[i, :9] = sol.y[:, -1]
-                else:
-                    X[i, :9] = s[:9]
-                X[i, 9] = estimated_params['Tmin_est']
-                X[i, 10] = estimated_params['Tmax_est']
-                X[i, 11] = estimated_params['R0_est']
-                X[i, 12] = estimated_params['k_r_est']
-                X[i, 13] = estimated_params['beta_humid_est']
-            noise = np.random.multivariate_normal(np.zeros(X.shape[1]), Q, X.shape[0])
-            return np.maximum(X + noise, 0)
+         filter_init_state = np.array([
+             *initial_human_comps,
+             *initial_mosq_comps,
+             *init_state_template[9:] # Estimated parameters
+             ])
 
-        # --- Forecast for selected year ---
-        yearly_df = df[df['year'] == year].copy()
-        if len(yearly_df) < 20:
-            st.warning("Not enough data for the selected year.")
-            st.stop()
-        train = yearly_df.iloc[:8]
-        test = yearly_df.iloc[8:]
 
-        X_train = train[lag_cols + climate_cols]
-        y_train = train[target_col].shift(-1).dropna()
-        X_train = X_train.loc[y_train.index]
-        rf = RandomForestRegressor(n_estimators=100, random_state=42)
-        if not X_train.empty:
-            rf.fit(X_train, y_train)
+    filter_init_P = init_P_template.copy() # Start with the template P matrix (based on proportions)
+
+    # Adjust the P for human compartments based on the current year's population scale
+    filter_init_P[0, 0] *= current_year_pop # Sh
+    filter_init_P[1, 1] *= current_year_pop # Eh
+    filter_init_P[2, 2] *= current_year_pop # Ih
+    filter_init_P[3, 3] *= current_year_pop # Rh
+    filter_init_P[4, 4] *= current_year_pop # Vh
+
+    # Adjust the P for mosquito compartments based on the current year's mosquito population scale
+    filter_init_P[5, 5] *= current_year_mosq_pop # Sm
+    filter_init_P[6, 6] *= current_year_mosq_pop # Em
+    filter_init_P[7, 7] *= current_year_mosq_pop # Im
+    filter_init_P[8, 8] *= current_year_mosq_pop # Wm
+
+    # Ensure P matrix is a float array before returning
+    filter_init_P = np.asarray(filter_init_P, dtype=float)
+
+    return filter_init_state, filter_init_P, current_year_pop, current_year_mosq_pop
+
+# Modified to run for a single year and return data for Streamlit display
+def run_yearly_forecast_streamlit(enkf, df_full, train_data, test_data, rf_model, current_year_pop, current_year_mosq_pop, climate_cols, target_col, lag_cols, init_params, hx_func, R_val=200., rf_R_val=None):
+
+    fx.pf = init_params
+    fx.Nh = current_year_pop
+    fx.N_mosq = current_year_mosq_pop
+    enkf.fx = fx # Assign fx function to the filter
+
+    # Run filter over training data (warm-up)
+    for i in range(len(train_data)):
+        t_idx = train_data.index[i]
+        obs = train_data.loc[t_idx, target_col]
+        cl = train_data.loc[t_idx, climate_cols].to_dict()
+
+        if any(pd.isna(val) for val in cl.values()):
+            continue
+
+        fx.climate = cl # Update climate for fx
+
+        # If it's the fusion filter, get RF prediction for update
+        rf_pred = np.nan
+        if rf_model is not None and rf_R_val is not None and t_idx in df_full.index and not df_full.loc[[t_idx], lag_cols + climate_cols].isnull().values.any():
+             rf_pred = rf_model.predict(df_full.loc[[t_idx], lag_cols + climate_cols])[0]
+
+
+        enkf.predict()
+
+        # Update based on filter type
+        if rf_R_val is None: # Base filter (no RF)
+             enkf.update(np.array([obs]))
+        else: # Fusion filter (with RF prediction as a second measurement)
+             if not np.isnan(rf_pred):
+                 enkf.update(np.array([obs, rf_pred]))
+             else:
+                 # If RF prediction is NaN, set a very large covariance for the second measurement
+                 enkf.update(np.array([obs, 0]), R=np.array([[R_val, 0.], [0., 1e10]]))
+
+
+    # --- Forecasting on Test Data ---
+    forecast = {'true': [], 'pred': [], 'dates': []} # Also store dates
+
+    for i in range(len(test_data) - 1):
+        t_idx = test_data.index[i]
+        fut_idx = test_data.index[i + 1]
+
+        if t_idx not in df_full.index:
+            continue
+
+        obs = df_full.loc[t_idx, target_col] # Current observation for update
+        cl = df_full.loc[t_idx, climate_cols].to_dict() # Climate for the current step
+
+        if any(pd.isna(val) for val in cl.values()):
+            st.warning(f"Skipping update for {t_idx} due to missing climate data.")
+            forecast['true'].append(df_full.loc[fut_idx, target_col] if fut_idx in df_full.index else np.nan)
+            forecast['pred'].append(np.nan)
+            forecast['dates'].append(fut_idx)
+            continue
+
+        fx.climate = cl # Update climate for fx
+
+        # Get RF prediction for fusion update using current data (still needed for fusion update)
+        rf_pred_current = np.nan
+        if rf_model is not None and rf_R_val is not None and t_idx in df_full.index and not df_full.loc[[t_idx], lag_cols + climate_cols].isnull().values.any():
+            rf_pred_current = rf_model.predict(df_full.loc[[t_idx], lag_cols + climate_cols])[0]
+
+        enkf.predict()
+
+        # Update based on filter type
+        if rf_R_val is None: # Base filter
+             enkf.update(np.array([obs]))
+        else: # Fusion filter
+             if not np.isnan(rf_pred_current):
+                 enkf.update(np.array([obs, rf_pred_current]))
+             else:
+                 enkf.update(np.array([obs, 0]), R=np.array([[R_val, 0.], [0., 1e10]]))
+
+        # --- Generate 1-week ahead forecast ---
+        if fut_idx not in df_full.index:
+            forecast['true'].append(np.nan)
+            forecast['pred'].append(np.nan)
+            forecast['dates'].append(fut_idx)
+            continue
+
+        true_val = df_full.loc[fut_idx, target_col]
+        forecast['true'].append(true_val)
+        forecast['dates'].append(fut_idx)
+
+        future_clim = df_full.loc[fut_idx, climate_cols].to_dict() # Climate for prediction step
+        if any(pd.isna(val) for val in future_clim.values()):
+             st.warning(f"Skipping forecast for {fut_idx} due to missing future climate data.")
+             forecast['pred'].append(np.nan)
         else:
-            rf = None
+            fx.climate = future_clim # Update climate for the prediction step
+            s = enkf.x.copy()
+            estimated_params = {
+                'Tmin_est': s[9], 'Tmax_est': s[10], 'R0_est': s[11], 'k_r_est': s[12], 'beta_humid_est': s[13]
+            }
+            ode_par = {
+                **init_params,
+                **estimated_params,
+                'BIRTH_DEATH_RATE': init_params['BIRTH_DEATH_RATE']
+            }
+            sol = solve_ivp(seir_sei_control, [0, 7], s[:9], args=(ode_par, future_clim, current_year_pop, current_year_mosq_pop), t_eval=[7], method='RK45', events=None)
+            pred = init_params['gamma_h'] * sol.y[2, -1] if sol.status == 0 else np.nan
+            forecast['pred'].append(max(pred, 0) if not np.isnan(pred) else np.nan)
 
-        filter_init_state = init_state.copy()
-        filter_init_P = init_P.copy()
-        enkf_base = EnsembleKalmanFilter(x=filter_init_state, P=filter_init_P, dim_z=1, dt=7.0, N=n_ens, fx=lambda x, dt: x, hx=hx_base)
-        enkf_base.Q = Q
-        enkf_base.R = np.array([[200.]])
-        enkf_base.ensembles = filter_init_state.copy() + np.random.multivariate_normal(np.zeros(len(filter_init_state)), filter_init_P, n_ens)
+    # --- Evaluate Yearly Forecast ---
+    metrics = {}
+    min_len = min(len(forecast['true']), len(forecast['pred']))
+    y = np.array(forecast['true'][:min_len])
+    f = np.array(forecast['pred'][:min_len])
+    dates_eval = np.array(forecast['dates'][:min_len])
 
-        enkf_fus = EnsembleKalmanFilter(x=filter_init_state.copy(), P=filter_init_P.copy(), dim_z=2, dt=7.0, N=n_ens, fx=lambda x, dt: x, hx=hx_fusion)
-        enkf_fus.Q = Q
-        enkf_fus.R = np.diag([200., 300.])
-        enkf_fus.ensembles = filter_init_state.copy() + np.random.multivariate_normal(np.zeros(len(filter_init_state)), filter_init_P, n_ens)
+    valid = ~np.isnan(f) & ~np.isnan(y)
+    if valid.sum() > 0:
+        metrics['mae'] = mean_absolute_error(y[valid], f[valid])
+        metrics['rmse'] = np.sqrt(mean_squared_error(y[valid], f[valid]))
 
-        forecast = {'true': [], 'base': [], 'fus': [], 'rf': []}
+        denominator = y[valid] + 1e-5
+        accuracy_vals = np.abs(f[valid] - y[valid]) / denominator
+        metrics['pct_acc'] = 100 - np.mean(accuracy_vals) * 100 if len(accuracy_vals) > 0 else np.nan
 
-        for i in range(len(test) - 1):
-            t_idx = test.index[i]
-            fut_idx = test.index[i + 1]
-            if t_idx not in df.index:
-                continue
-            obs = df.loc[t_idx, target_col]
-            cl = df.loc[t_idx, climate_cols].to_dict()
-            if any(pd.isna(val) for val in cl.values()):
-                continue
-            fx.climate = cl
-            fx.pf = init_params
-            enkf_base.fx = fx
-            enkf_fus.fx = fx
-            enkf_base.predict()
-            enkf_base.update(np.array([obs]))
-            rf_pred = np.nan
-            if rf is not None and t_idx in df.index and not df.loc[[t_idx], lag_cols + climate_cols].isnull().values.any():
-                rf_pred = rf.predict(df.loc[[t_idx], lag_cols + climate_cols])[0]
-            enkf_fus.predict()
-            if not np.isnan(rf_pred):
-                enkf_fus.update(np.array([obs, rf_pred]))
+        # Peak Week Timing Error
+        if len(y) > 0 and np.max(y) > 0 and valid.sum() > 0:
+            try:
+                # Find peak in valid true data
+                true_peak_relative_idx = np.argmax(y[valid])
+                # Map back to the original list index
+                true_peak_forecast_list_idx = np.where(valid)[0][true_peak_relative_idx]
+                # Get the date from the dates list
+                true_peak_date = dates_eval[true_peak_forecast_list_idx]
+
+                # Find peak in valid predicted data
+                predicted_peak_relative_idx = np.argmax(f[valid])
+                 # Map back to the original list index
+                predicted_peak_forecast_list_idx = np.where(valid)[0][predicted_peak_relative_idx]
+                # Get the date from the dates list
+                predicted_peak_date = dates_eval[predicted_peak_forecast_list_idx]
+
+                # Calculate difference in weeks
+                weeks_off = np.abs((predicted_peak_date - true_peak_date).days / 7.0)
+                metrics['peak_weeks_off'] = weeks_off
+            except Exception as e:
+                 st.warning(f"Error calculating peak week timing: {e}")
+                 metrics['peak_weeks_off'] = np.nan
+        else:
+            metrics['peak_weeks_off'] = np.nan
+
+    else:
+        metrics = {'mae': np.nan, 'rmse': np.nan, 'pct_acc': np.nan, 'peak_weeks_off': np.nan}
+
+
+    # Return data for plotting and metrics
+    plot_data = pd.DataFrame({
+        'Date': forecast['dates'],
+        'True Cases': forecast['true'],
+        'Predicted Cases': forecast['pred']
+    }).set_index('Date')
+
+    return plot_data, metrics
+
+
+# --- Streamlit App Logic ---
+st.header("Forecast Visualization and Evaluation")
+
+api_key = st.text_input("Enter your Mosqlimate API Key:", type="password", key="api_key_input")
+geocode = st.number_input("Enter geocode (e.g., 3304557):", value=3304557, key="geocode_input")
+selected_year = st.number_input("Enter year to visualize (e.g., 2023):", min_value=2010, max_value=2024, value=2023, key="year_input") # Limit years to available data
+run_button = st.button("Run Forecast", key="run_button")
+
+if api_key and run_button:
+    import mosqlient
+    climate_cols = ['tempmed', 'precip_tot_sum', 'umidmed']
+    target_col = 'casos_est'
+    pop_col = 'pop'
+    rf_R_val = 300. # R value for RF observation in fusion
+    n_ens = 100 # Ensemble size
+    R_val = 200. # R value for case observations
+
+    try:
+        with st.spinner(f"Downloading data for geocode {geocode}..."):
+            # Fetch data for a wider range to allow for lags and training data from previous years
+            start_year_data = max(2010, selected_year - 2) # Get data from up to 2 years prior
+            end_year_data = 2024 # Get data up to 2024
+
+            climate_df_raw = mosqlient.get_climate_weekly(
+                api_key = api_key,
+                start = f"{start_year_data}01",
+                end = f"{end_year_data}52",
+                geocode = geocode,
+            )
+            cases_df_raw = mosqlient.get_infodengue(
+                api_key = api_key,
+                disease='dengue',
+                start_date = f"{start_year_data}-01-01",
+                end_date = f"{end_year_data}-12-31",
+                geocode = geocode,
+            )
+
+        st.success("Data downloaded successfully!")
+
+        # Data cleaning and merging (adapted from previous code)
+        if 'SE' in cases_df_raw.columns:
+            cases_df_raw['SE'] = cases_df_raw['SE'].astype(int)
+        if 'epiweek' in climate_df_raw.columns:
+            climate_df_raw['epiweek'] = climate_df_raw['epiweek'].astype(int)
+        if 'municipio_geocodigo' in cases_df_raw.columns:
+            cases_df_raw = cases_df_raw.rename(columns={'municipio_geocodigo': 'geocode'})
+        if 'geocodigo' in climate_df_raw.columns:
+            climate_df_raw = climate_df_raw.rename(columns={'geocodigo': 'geocode'})
+
+        # Ensure date columns are datetime and set index
+        climate_df_raw['data_iniSE'] = pd.to_datetime(climate_df_raw['data_date']) # Use data_date for climate
+        cases_df_raw['data_iniSE'] = pd.to_datetime(cases_df_raw['data_iniSE'])
+
+        # Combine and sort
+        merged_df = pd.merge(cases_df_raw[['data_iniSE', target_col, pop_col, 'SE']],
+                             climate_df_raw[['data_iniSE'] + climate_cols],
+                             on='data_iniSE', how='left') # Use left merge to keep all case dates
+        merged_df.set_index('data_iniSE', inplace=True)
+        merged_df.sort_index(inplace=True)
+
+        # Calculate yearly average population BEFORE dropping NAs for lags
+        merged_df['year'] = merged_df['SE'].astype(str).str[:4].astype(int)
+        yearly_avg_pop = merged_df.groupby('year')[pop_col].mean()
+
+        # Create lags (on the full merged_df before filtering for the year)
+        lag_cols = []
+        for feat in [target_col] + climate_cols:
+            for lag in range(1, 5):
+                merged_df[f'{feat}_lag{lag}'] = merged_df[feat].shift(lag)
+                lag_cols.append(f'{feat}_lag{lag}')
+
+        # Drop NA rows (after creating all lags)
+        merged_df.dropna(subset=lag_cols + climate_cols + [target_col, pop_col], inplace=True) # Drop rows if any required column is NaN
+
+
+        # Filter data for the selected year and the necessary training period
+        # Training data: Last 8 weeks of the previous year + first 8 weeks of selected year
+        # Test data: Rest of the selected year
+
+        # Find the start and end dates for the selected year
+        start_date_year = pd.to_datetime(f'{selected_year}-01-01')
+        end_date_year = pd.to_datetime(f'{selected_year}-12-31')
+
+        # Filter data for the selected year and previous year(s) needed for training
+        # Need data starting at least 8 weeks before the start of the selected year
+        train_start_date = start_date_year - pd.Timedelta(weeks=8)
+
+        yearly_df_full = merged_df.loc[train_start_date:end_date_year].copy()
+
+        if yearly_df_full.empty:
+            st.warning(f"No data available for the selected year {selected_year} and the required training period.")
+        else:
+            # Split into train and test for the selected year
+            # Train data: All data in yearly_df_full *before or including* the first 8 weeks of the selected year
+            # Test data: All data in yearly_df_full *after* the first 8 weeks of the selected year
+
+            # Find the date marking the end of the first 8 weeks of the selected year
+            end_of_train_date = start_date_year + pd.Timedelta(weeks=7) # End of week 8
+
+            train_data = yearly_df_full.loc[:end_of_train_date]
+            test_data = yearly_df_full.loc[end_of_train_date + pd.Timedelta(days=1):]
+
+            if train_data.empty:
+                 st.warning(f"Insufficient training data available for {selected_year}.")
+            elif test_data.empty:
+                 st.warning(f"Insufficient test data available for {selected_year}.")
             else:
-                enkf_fus.update(np.array([obs, 0]), R=np.array([[200., 0.], [0., 1e10]]))
-            if fut_idx not in df.index:
-                for m in ['base', 'fus', 'rf']:
-                    forecast[m].append(np.nan)
-                forecast['true'].append(np.nan)
-                continue
-            true_val = df.loc[fut_idx, target_col]
-            forecast['true'].append(true_val)
-            future_clim = df.loc[fut_idx, climate_cols].to_dict()
-            if any(pd.isna(val) for val in future_clim.values()):
-                for m in ['base', 'fus', 'rf']:
-                    forecast[m].append(np.nan)
-                continue
-            forecast_clim = future_clim
-            for key, enkf in [('base', enkf_base), ('fus', enkf_fus)]:
-                s = enkf.x.copy()
-                estimated_params = {
-                    'Tmin_est': s[9], 'Tmax_est': s[10], 'R0_est': s[11], 'k_r_est': s[12], 'beta_humid_est': s[13]
-                }
-                ode_par = {
-                    **init_params,
-                    **estimated_params,
-                    'BIRTH_DEATH_RATE': 1 / (70 * 52)
-                }
-                sol = solve_ivp(seir_sei_control, [0, 7], s[:9], args=(ode_par, forecast_clim), t_eval=[7], method='RK45', events=None)
-                pred = init_params['gamma_h'] * sol.y[2, -1] if sol.status == 0 else np.nan
-                forecast[key].append(max(pred, 0) if not np.isnan(pred) else np.nan)
-            rf_pred_next = np.nan
-            if rf is not None and t_idx in df.index and not df.loc[[t_idx], lag_cols + climate_cols].isnull().values.any():
-                rf_pred_next = rf.predict(df.loc[[t_idx], lag_cols + climate_cols])[0]
-            forecast['rf'].append(max(rf_pred_next, 0) if not np.isnan(rf_pred_next) else np.nan)
+                st.write(f"Running forecast for {selected_year}...")
 
-        # --- Plotting ---
-        st.subheader(f"Predicted vs Observed Cases for {year} (geocode: {geocode})")
-        plot_len = min(len(test.index) - 1, len(forecast['true']))
-        if plot_len > 0:
-            plot_indices = test.index[1:plot_len+1]
-            fig, ax = plt.subplots(figsize=(12, 5))
-            ax.plot(plot_indices, forecast['true'][:plot_len], label='True Cases', marker='o')
-            for m in ['base', 'fus', 'rf']:
-                data_to_plot = np.array(forecast[m][:plot_len])
-                ax.plot(plot_indices[~np.isnan(data_to_plot)], data_to_plot[~np.isnan(data_to_plot)], label=f'{m.upper()}', linestyle='--')
-            ax.set_title(f'Dengue Case Forecast for {year}')
-            ax.set_xlabel('Date')
-            ax.set_ylabel('Estimated Cases')
-            ax.legend()
-            ax.grid(True)
-            st.pyplot(fig)
-        else:
-            st.warning("Not enough data to plot for the selected year.")
+                # Train RF model for the year (still needed for fusion filter)
+                # Train RF on all available data up to the end of the training period
+                X_train_rf = train_data[lag_cols + climate_cols]
+                # Target for RF is the case count 1 week ahead
+                y_train_rf = train_data[target_col].shift(-1).dropna()
+                # Align X_train_rf and y_train_rf indices
+                X_train_rf = X_train_rf.loc[y_train_rf.index]
+
+                rf = RandomForestRegressor(n_estimators=100, random_state=42)
+                if not X_train_rf.empty:
+                    rf.fit(X_train_rf, y_train_rf)
+                else:
+                    rf = None # Keep rf as None if training data is empty
+
+                # Initialize filter state and parameters for the year
+                # Use the full yearly_df_full (including training data) for pop calculation
+                filter_init_state, filter_init_P, current_year_pop, current_year_mosq_pop = initialize_filter_state(
+                    yearly_df_full.loc[start_date_year:].iloc[:1], # Use only the first row of the selected year for initial state
+                    yearly_avg_pop, target_col, init_params, init_state_template, init_P_template
+                )
+
+                # Initialize EnKF filters for the year
+                enkf_base = EnsembleKalmanFilter(x=filter_init_state.copy(), P=filter_init_P.copy(), dim_z=1, dt=7.0, N=n_ens, fx=lambda x, dt: x, hx=hx_base)
+                enkf_base.Q = Q
+                enkf_base.R = np.array([[R_val]])
+                enkf_base.ensembles = filter_init_state.copy() + np.random.multivariate_normal(np.zeros(len(filter_init_state)), np.asarray(filter_init_P, dtype=float), n_ens)
+
+                enkf_fus = EnsembleKalmanFilter(x=filter_init_state.copy(), P=filter_init_P.copy(), dim_z=2, dt=7.0, N=n_ens, fx=lambda x, dt: x, hx=hx_fusion)
+                enkf_fus.Q = Q
+                enkf_fus.R = np.diag([R_val, rf_R_val]) # Use defined R values
+                enkf_fus.ensembles = filter_init_state.copy() + np.random.multivariate_normal(np.zeros(len(filter_init_state)), np.asarray(filter_init_P, dtype=float), n_ens)
+
+
+                # --- Run Forecasting and Evaluation for the Selected Year ---
+                with st.spinner(f"Generating forecast for {selected_year}..."):
+                    # Run Base Filter Forecast
+                    forecast_data_base, metrics_base = run_yearly_forecast_streamlit(
+                        enkf_base, merged_df, train_data, test_data, rf_model=None, current_year_pop=current_year_pop, current_year_mosq_pop=current_year_mosq_pop, climate_cols=climate_cols, target_col=target_col, lag_cols=lag_cols, init_params=init_params, hx_func=hx_base, R_val=R_val, rf_R_val=None
+                    )
+
+                    # Run Fusion Filter Forecast
+                    forecast_data_fus, metrics_fus = run_yearly_forecast_streamlit(
+                        enkf_fus, merged_df, train_data, test_data, rf_model=rf, current_year_pop=current_year_pop, current_year_mosq_pop=current_year_mosq_pop, climate_cols=climate_cols, target_col=target_col, lag_cols=lag_cols, init_params=init_params, hx_func=hx_fusion, R_val=R_val, rf_R_val=rf_R_val
+                    )
+
+                st.success("Forecast generated!")
+
+                # --- Display Results ---
+                st.subheader(f"Forecast for {selected_year}")
+
+                # Combine forecast data for plotting
+                plot_df = pd.DataFrame({
+                    'True Cases': forecast_data_base['True Cases'], # True cases are the same for both
+                    'BASE Prediction': forecast_data_base['Predicted Cases'],
+                    'FUSION Prediction': forecast_data_fus['Predicted Cases']
+                })
+
+                st.line_chart(plot_df)
+
+                st.subheader("Evaluation Metrics")
+                metrics_df = pd.DataFrame({
+                    'Metric': ['MAE', 'RMSE', 'Avg Accuracy (%)', 'Peak Weeks Off'],
+                    'BASE': [metrics_base['mae'], metrics_base['rmse'], metrics_base['pct_acc'], metrics_base['peak_weeks_off']],
+                    'FUSION': [metrics_fus['mae'], metrics_fus['rmse'], metrics_fus['pct_acc'], metrics_fus['peak_weeks_off']]
+                }).set_index('Metric')
+
+                st.table(metrics_df.round(2))
+
+
     except Exception as e:
-        st.error(f"Error during modeling/forecasting: {e}")
+        st.error(f"An error occurred: {e}")
+        st.write("Please check your API key, geocode, and ensure data is available for the selected year.")
