@@ -7,6 +7,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from scipy.integrate import solve_ivp
 from filterpy.kalman import EnsembleKalmanFilter
 import matplotlib.pyplot as plt
+import mosqlient # Import mosqlient
 
 st.set_page_config(page_title="Dengue Forecasting", layout="wide")
 
@@ -413,6 +414,7 @@ def run_yearly_forecast_streamlit(enkf, df_full, train_data, test_data, rf_model
 
 
 # --- Streamlit App Logic ---
+st.title("Dengue Forecasting: Predicted vs Observed Cases")
 st.header("Forecast Visualization and Evaluation")
 
 api_key = st.text_input("Enter your Mosqlimate API Key:", type="password", key="api_key_input")
@@ -421,27 +423,29 @@ selected_year = st.number_input("Enter year to visualize (e.g., 2023):", min_val
 run_button = st.button("Run Forecast", key="run_button")
 
 if api_key and run_button:
-    import mosqlient
+    # --- Data Acquisition (Updated) ---
     climate_cols = ['tempmed', 'precip_tot_sum', 'umidmed']
     target_col = 'casos_est'
     pop_col = 'pop'
     rf_R_val = 300. # R value for RF observation in fusion
     n_ens = 100 # Ensemble size
     R_val = 200. # R value for case observations
+    lag_cols = [] # Define lag_cols here to be populated after lag creation
 
     try:
         with st.spinner(f"Downloading data for geocode {geocode}..."):
             # Fetch data for a wider range to allow for lags and training data from previous years
+            # Need data starting at least 8 weeks before the start of the selected year
             start_year_data = max(2010, selected_year - 2) # Get data from up to 2 years prior
             end_year_data = 2024 # Get data up to 2024
 
-            climate_df_raw = mosqlient.get_climate_weekly(
+            climate_df = mosqlient.get_climate_weekly(
                 api_key = api_key,
                 start = f"{start_year_data}01",
                 end = f"{end_year_data}52",
                 geocode = geocode,
             )
-            cases_df_raw = mosqlient.get_infodengue(
+            cases_df = mosqlient.get_infodengue(
                 api_key = api_key,
                 disease='dengue',
                 start_date = f"{start_year_data}-01-01",
@@ -449,75 +453,104 @@ if api_key and run_button:
                 geocode = geocode,
             )
 
-        st.success("Data downloaded successfully!")
+        # Data cleaning and merging (Updated)
+        if 'SE' in cases_df.columns:
+            cases_df['SE'] = cases_df['SE'].astype(int)
+        if 'epiweek' in climate_df.columns:
+            climate_df['epiweek'] = climate_df['epiweek'].astype(int)
+        if 'municipio_geocodigo' in cases_df.columns:
+            cases_df = cases_df.rename(columns={'municipio_geocodigo': 'geocode'})
+        if 'geocodigo' in climate_df.columns:
+            climate_df = climate_df.rename(columns={'geocodigo': 'geocode'})
 
-        # Data cleaning and merging (adapted from previous code)
-        if 'SE' in cases_df_raw.columns:
-            cases_df_raw['SE'] = cases_df_raw['SE'].astype(int)
-        if 'epiweek' in climate_df_raw.columns:
-            climate_df_raw['epiweek'] = climate_df_raw['epiweek'].astype(int)
-        if 'municipio_geocodigo' in cases_df_raw.columns:
-            cases_df_raw = cases_df_raw.rename(columns={'municipio_geocodigo': 'geocode'})
-        if 'geocodigo' in climate_df_raw.columns:
-            climate_df_raw = climate_df_raw.rename(columns={'geocodigo': 'geocode'})
+        # Ensure data_date is datetime in climate_df for merging
+        climate_df['data_date'] = pd.to_datetime(climate_df['data_date'])
 
-        # Ensure date columns are datetime and set index
-        climate_df_raw['data_iniSE'] = pd.to_datetime(climate_df_raw['data_date']) # Use data_date for climate
-        cases_df_raw['data_iniSE'] = pd.to_datetime(cases_df_raw['data_iniSE'])
+        merged = pd.merge(
+            cases_df,
+            climate_df,
+            left_on=['geocode', 'SE'],
+            right_on=['geocode', 'epiweek'],
+            how='outer' # Use outer merge to keep all data points
+        )
 
-        # Combine and sort
-        merged_df = pd.merge(cases_df_raw[['data_iniSE', target_col, pop_col, 'SE']],
-                             climate_df_raw[['data_iniSE'] + climate_cols],
-                             on='data_iniSE', how='left') # Use left merge to keep all case dates
-        merged_df.set_index('data_iniSE', inplace=True)
-        merged_df.sort_index(inplace=True)
+        # Use the cases data_iniSE as the primary date index
+        merged['data_iniSE'] = pd.to_datetime(merged['data_iniSE'])
+        merged.set_index('data_iniSE', inplace=True)
+        merged.sort_index(inplace=True)
+
+        st.success("Data downloaded and merged successfully.")
+    except Exception as e:
+        st.error(f"Error downloading or merging data: {e}")
+        st.stop() # Stop execution if data loading fails
+
+
+    # --- Modeling & Forecast Section (Adapted from previous code) ---
+    try:
+        # Ensure required columns exist after merge
+        required_cols = climate_cols + [target_col, pop_col, 'SE']
+        if not all(col in merged.columns for col in required_cols):
+             missing = [col for col in required_cols if col not in merged.columns]
+             st.error(f"Missing required columns after merging: {missing}")
+             st.stop()
 
         # Calculate yearly average population BEFORE dropping NAs for lags
-        merged_df['year'] = merged_df['SE'].astype(str).str[:4].astype(int)
-        yearly_avg_pop = merged_df.groupby('year')[pop_col].mean()
+        merged['year'] = merged['SE'].astype(str).str[:4].astype(int)
+        yearly_avg_pop = merged.groupby('year')[pop_col].mean()
 
         # Create lags (on the full merged_df before filtering for the year)
         lag_cols = []
         for feat in [target_col] + climate_cols:
             for lag in range(1, 5):
-                merged_df[f'{feat}_lag{lag}'] = merged_df[feat].shift(lag)
-                lag_cols.append(f'{feat}_lag{lag}')
+                # Ensure the column exists before creating lag
+                if feat in merged.columns:
+                    merged[f'{feat}_lag{lag}'] = merged[feat].shift(lag)
+                    lag_cols.append(f'{feat}_lag{lag}')
+                else:
+                    st.warning(f"Cannot create lag for missing feature: {feat}")
 
-        # Drop NA rows (after creating all lags)
-        merged_df.dropna(subset=lag_cols + climate_cols + [target_col, pop_col], inplace=True) # Drop rows if any required column is NaN
+
+        # Drop NA rows (after creating all lags) - subset only on columns used in forecasting
+        subset_cols_for_dropna = lag_cols + climate_cols + [target_col, pop_col, 'SE']
+        # Filter for existing columns before dropping
+        subset_cols_for_dropna = [col for col in subset_cols_for_dropna if col in merged.columns]
+
+        merged.dropna(subset=subset_cols_for_dropna, inplace=True)
 
 
         # Filter data for the selected year and the necessary training period
-        # Training data: Last 8 weeks of the previous year + first 8 weeks of selected year
-        # Test data: Rest of the selected year
+        # Training data: Data before the start of the test period for the selected year
+        # Test data: Data within the selected year, after the training period
 
         # Find the start and end dates for the selected year
         start_date_year = pd.to_datetime(f'{selected_year}-01-01')
         end_date_year = pd.to_datetime(f'{selected_year}-12-31')
 
+        # Define the end date of the training period for the selected year (first 8 weeks)
+        end_of_train_date = start_date_year + pd.Timedelta(weeks=7) # End of week 8
+
         # Filter data for the selected year and previous year(s) needed for training
         # Need data starting at least 8 weeks before the start of the selected year
         train_start_date = start_date_year - pd.Timedelta(weeks=8)
 
-        yearly_df_full = merged_df.loc[train_start_date:end_date_year].copy()
+        # Use merged data for the relevant date range
+        yearly_df_full = merged.loc[train_start_date:end_date_year].copy()
+
 
         if yearly_df_full.empty:
-            st.warning(f"No data available for the selected year {selected_year} and the required training period.")
+            st.warning(f"No data available for the selected year {selected_year} and the required training period after dropping NA values.")
         else:
             # Split into train and test for the selected year
-            # Train data: All data in yearly_df_full *before or including* the first 8 weeks of the selected year
-            # Test data: All data in yearly_df_full *after* the first 8 weeks of the selected year
+            # Train data: All data in yearly_df_full *before or including* the end_of_train_date
+            # Test data: All data in yearly_df_full *after* the end_of_train_date
 
-            # Find the date marking the end of the first 8 weeks of the selected year
-            end_of_train_date = start_date_year + pd.Timedelta(weeks=7) # End of week 8
-
-            train_data = yearly_df_full.loc[:end_of_train_date]
-            test_data = yearly_df_full.loc[end_of_train_date + pd.Timedelta(days=1):]
+            train_data = yearly_df_full.loc[yearly_df_full.index <= end_of_train_date].copy()
+            test_data = yearly_df_full.loc[yearly_df_full.index > end_of_train_date].copy()
 
             if train_data.empty:
-                 st.warning(f"Insufficient training data available for {selected_year}.")
+                 st.warning(f"Insufficient training data available for {selected_year} after dropping NA values.")
             elif test_data.empty:
-                 st.warning(f"Insufficient test data available for {selected_year}.")
+                 st.warning(f"Insufficient test data available for {selected_year} after dropping NA values.")
             else:
                 st.write(f"Running forecast for {selected_year}...")
 
@@ -530,17 +563,24 @@ if api_key and run_button:
                 X_train_rf = X_train_rf.loc[y_train_rf.index]
 
                 rf = RandomForestRegressor(n_estimators=100, random_state=42)
-                if not X_train_rf.empty:
+                if not X_train_rf.empty and len(y_train_rf) > 0: # Check if there is data to train
                     rf.fit(X_train_rf, y_train_rf)
                 else:
-                    rf = None # Keep rf as None if training data is empty
+                    rf = None # Keep rf as None if training data is empty or no target
+
 
                 # Initialize filter state and parameters for the year
-                # Use the full yearly_df_full (including training data) for pop calculation
-                filter_init_state, filter_init_P, current_year_pop, current_year_mosq_pop = initialize_filter_state(
-                    yearly_df_full.loc[start_date_year:].iloc[:1], # Use only the first row of the selected year for initial state
-                    yearly_avg_pop, target_col, init_params, init_state_template, init_P_template
-                )
+                # Use the first row of the selected year's data for initial state if available
+                initial_state_df = yearly_df_full.loc[start_date_year:]
+                if not initial_state_df.empty:
+                    filter_init_state, filter_init_P, current_year_pop, current_year_mosq_pop = initialize_filter_state(
+                        initial_state_df.iloc[:1], # Use only the first row of the selected year for initial state
+                        yearly_avg_pop, target_col, init_params, init_state_template, init_P_template
+                    )
+                else:
+                     st.error(f"Could not initialize filter state for {selected_year}. No data found for the start of the year.")
+                     st.stop()
+
 
                 # Initialize EnKF filters for the year
                 enkf_base = EnsembleKalmanFilter(x=filter_init_state.copy(), P=filter_init_P.copy(), dim_z=1, dt=7.0, N=n_ens, fx=lambda x, dt: x, hx=hx_base)
@@ -558,12 +598,12 @@ if api_key and run_button:
                 with st.spinner(f"Generating forecast for {selected_year}..."):
                     # Run Base Filter Forecast
                     forecast_data_base, metrics_base = run_yearly_forecast_streamlit(
-                        enkf_base, merged_df, train_data, test_data, rf_model=None, current_year_pop=current_year_pop, current_year_mosq_pop=current_year_mosq_pop, climate_cols=climate_cols, target_col=target_col, lag_cols=lag_cols, init_params=init_params, hx_func=hx_base, R_val=R_val, rf_R_val=None
+                        enkf_base, merged, train_data, test_data, rf_model=None, current_year_pop=current_year_pop, current_year_mosq_pop=current_year_mosq_pop, climate_cols=climate_cols, target_col=target_col, lag_cols=lag_cols, init_params=init_params, hx_func=hx_base, R_val=R_val, rf_R_val=None
                     )
 
                     # Run Fusion Filter Forecast
                     forecast_data_fus, metrics_fus = run_yearly_forecast_streamlit(
-                        enkf_fus, merged_df, train_data, test_data, rf_model=rf, current_year_pop=current_year_pop, current_year_mosq_pop=current_year_mosq_pop, climate_cols=climate_cols, target_col=target_col, lag_cols=lag_cols, init_params=init_params, hx_func=hx_fusion, R_val=R_val, rf_R_val=rf_R_val
+                        enkf_fus, merged, train_data, test_data, rf_model=rf, current_year_pop=current_year_pop, current_year_mosq_pop=current_year_mosq_pop, climate_cols=climate_cols, target_col=target_col, lag_cols=lag_cols, init_params=init_params, hx_func=hx_fusion, R_val=R_val, rf_R_val=rf_R_val
                     )
 
                 st.success("Forecast generated!")
@@ -583,13 +623,13 @@ if api_key and run_button:
                 st.subheader("Evaluation Metrics")
                 metrics_df = pd.DataFrame({
                     'Metric': ['MAE', 'RMSE', 'Avg Accuracy (%)', 'Peak Weeks Off'],
-                    'BASE': [metrics_base['mae'], metrics_base['rmse'], metrics_base['pct_acc'], metrics_base['peak_weeks_off']],
-                    'FUSION': [metrics_fus['mae'], metrics_fus['rmse'], metrics_fus['pct_acc'], metrics_fus['peak_weeks_off']]
+                    'BASE': [metrics_base.get('mae'), metrics_base.get('rmse'), metrics_base.get('pct_acc'), metrics_base.get('peak_weeks_off')],
+                    'FUSION': [metrics_fus.get('mae'), metrics_fus.get('rmse'), metrics_fus.get('pct_acc'), metrics_fus.get('peak_weeks_off')]
                 }).set_index('Metric')
 
                 st.table(metrics_df.round(2))
 
 
     except Exception as e:
-        st.error(f"An error occurred: {e}")
-        st.write("Please check your API key, geocode, and ensure data is available for the selected year.")
+        st.error(f"An error occurred during modeling or forecasting: {e}")
+        st.write("Please check the data for the selected year and ensure it has the necessary columns and format.")
